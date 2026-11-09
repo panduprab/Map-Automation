@@ -1,0 +1,166 @@
+import arcpy, os, calendar, datetime
+
+# ================== SETTINGS ==================
+MXD_PATH     = "CURRENT"
+LAYER_NAME   = "LONSUM BRIN 2026 NEW"      # <-- change to your Gunung Malayu hotspot layer
+DATE_FIELD   = "tanggal__W"
+TITLE_ELEM   = "TitleBulan"
+SCALE_ELEM   = None                      # Element Name of a plain scale text, or None if dynamic
+TITLE_PREFIX = "Data Hotspot Bulan"
+
+PERIOD_START = datetime.date(2026, 5, 1)     # first day of the whole period
+PERIOD_END   = datetime.date(2026, 10, 26)   # last day of data
+
+SCALES_FULL  = [125000, 50000]   # whole period and full-month pages
+SCALES_DAY   = [125000]          # single-day pages
+DAYS         = [15, 1]           # single-day pages per month, in this order ([] = none)
+NEWEST_FIRST = True              # True = Okt, Sep, Agu... like your sample | False = Jun, Jul...
+
+OUT_FOLDER   = r"C:\Users\GUNAWAN\OneDrive\Documents\Kantor\LONSUM\HOTSPOT\TeSTscript"
+MERGE_PDF    = True
+# ===============================================
+
+BULAN = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+         "Agustus", "September", "Oktober", "November", "Desember"]
+
+mxd = arcpy.mapping.MapDocument(MXD_PATH)
+
+# --- layer and its data frame ---
+lyr = None
+df = None
+for d in arcpy.mapping.ListDataFrames(mxd):
+    found = arcpy.mapping.ListLayers(mxd, LAYER_NAME, d)
+    if found:
+        lyr, df = found[0], d
+        break
+if lyr is None:
+    raise ValueError("Layer '%s' tidak ditemukan" % LAYER_NAME)
+
+titles = arcpy.mapping.ListLayoutElements(mxd, "TEXT_ELEMENT", TITLE_ELEM)
+if not titles:
+    raise ValueError("Text element '%s' tidak ditemukan" % TITLE_ELEM)
+title = titles[0]
+
+scale_txt = None
+if SCALE_ELEM:
+    s = arcpy.mapping.ListLayoutElements(mxd, "TEXT_ELEMENT", SCALE_ELEM)
+    if not s:
+        raise ValueError("Scale element '%s' tidak ditemukan" % SCALE_ELEM)
+    scale_txt = s[0]
+
+ftypes = dict((f.name.lower(), f.type) for f in arcpy.ListFields(lyr))
+if DATE_FIELD.lower() not in ftypes:
+    raise ValueError("Field '%s' tidak ada. Tersedia: %s" % (DATE_FIELD, ", ".join(ftypes.keys())))
+is_date = (ftypes[DATE_FIELD.lower()] == "Date")
+
+if not os.path.exists(OUT_FOLDER):
+    os.makedirs(OUT_FOLDER)
+
+# remember the starting state so it can be restored at the end
+orig_title  = title.text
+orig_extent = df.extent
+orig_query  = lyr.definitionQuery
+
+fld = arcpy.AddFieldDelimiters(lyr.dataSource, DATE_FIELD)
+pdf_list = []
+
+
+# ---------- helpers ----------
+def fmt_day(d):
+    return "%d %s %d" % (d.day, BULAN[d.month - 1], d.year)
+
+
+def range_text(s, e):
+    if s == e:
+        return fmt_day(s)                                    # 15 Oktober 2026
+    if s.year == e.year and s.month == e.month:
+        return "%d - %s" % (s.day, fmt_day(e))               # 1 - 26 Oktober 2026
+    if s.year == e.year:
+        return "%d %s - %s" % (s.day, BULAN[s.month - 1], fmt_day(e))   # 1 Juni - 26 Oktober 2026
+    return "%s - %s" % (fmt_day(s), fmt_day(e))
+
+
+def make_query(start_date, end_date):
+    """Records from start_date up to and including end_date."""
+    nxt = end_date + datetime.timedelta(days=1)
+    if is_date:
+        return "%s >= date '%s' AND %s < date '%s'" % (
+            fld, start_date.isoformat(), fld, nxt.isoformat())
+    return "%s >= '%s' AND %s < '%s'" % (
+        fld, start_date.isoformat(), fld, nxt.isoformat())
+
+
+def month_ranges():
+    """[(year, month, first_day_in_period, last_day_in_period), ...] oldest first."""
+    out = []
+    y, m = PERIOD_START.year, PERIOD_START.month
+    while (y, m) <= (PERIOD_END.year, PERIOD_END.month):
+        first = datetime.date(y, m, 1)
+        last = datetime.date(y, m, calendar.monthrange(y, m)[1])
+        out.append((y, m, max(first, PERIOD_START), min(last, PERIOD_END)))
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return out
+
+
+def export_page(label, title_text, start_date, end_date, scales):
+    lyr.definitionQuery = make_query(start_date, end_date)
+    title.text = title_text
+    for sc in scales:
+        df.extent = orig_extent          # same center for every scale
+        df.scale = sc
+        if scale_txt:
+            scale_txt.text = "1:{:,}".format(sc).replace(",", ".")
+        arcpy.RefreshActiveView()
+        name = "Hotspot_%s_%d_%d.pdf" % (label, sc // 1000, start_date.year)
+        out_pdf = os.path.join(OUT_FOLDER, name)
+        arcpy.mapping.ExportToPDF(mxd, out_pdf, resolution=300)
+        pdf_list.append(out_pdf)         # export order = merge order
+        print("Selesai: " + name)
+
+
+# ---------- build the page list in the final order ----------
+pages = [("Periode",
+          "%s %s" % (TITLE_PREFIX, range_text(PERIOD_START, PERIOD_END)),
+          PERIOD_START, PERIOD_END, SCALES_FULL)]
+
+months = month_ranges()
+if NEWEST_FIRST:
+    months.reverse()
+
+for (y, m, s, e) in months:
+    mn = BULAN[m - 1]
+    pages.append((mn,
+                  "%s %s (%s)" % (TITLE_PREFIX, mn, range_text(s, e)),
+                  s, e, SCALES_FULL))
+    for dd in DAYS:
+        if dd > calendar.monthrange(y, m)[1]:
+            continue
+        day = datetime.date(y, m, dd)
+        if s <= day <= e:                # only days inside the period
+            pages.append(("%s_tgl%02d" % (mn, dd),
+                          "%s %s (%s)" % (TITLE_PREFIX, mn, fmt_day(day)),
+                          day, day, SCALES_DAY))
+
+# ---------- run ----------
+try:
+    for (label, ttl, s, e, scales) in pages:
+        export_page(label, ttl, s, e, scales)
+
+    if MERGE_PDF:
+        merged = os.path.join(OUT_FOLDER, "Hotspot_Gabungan_%s_%s.pdf" % (
+            PERIOD_START.isoformat(), PERIOD_END.isoformat()))
+        if os.path.exists(merged):
+            os.remove(merged)
+        doc = arcpy.mapping.PDFDocumentCreate(merged)
+        for p in pdf_list:
+            doc.appendPages(p)
+        doc.saveAndClose()
+        print("Gabungan: " + merged)
+finally:
+    # always restore the map, even if something fails midway
+    lyr.definitionQuery = orig_query
+    title.text = orig_title
+    df.extent = orig_extent
+    arcpy.RefreshActiveView()
